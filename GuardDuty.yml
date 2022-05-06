@@ -1,0 +1,187 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  BucketName: 
+    Type: "String"
+    Description: "Add a unique s3 Bucket Name"
+  DetectorId:
+    Type: "String"
+    Description: "GuardDuty Detector Id"
+Resources:
+  Bucket:
+    DependsOn: Key
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - BucketKeyEnabled: true
+          ServerSideEncryptionByDefault:
+            SSEAlgorithm: 'aws:kms'
+            KMSMasterKeyID: !GetAtt 'Key.Arn'
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties: 
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Deny non-HTTPS access
+            Effect: Deny
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: 's3:*'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${Bucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: Deny incorrect encryption header
+            Effect: Deny
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${Bucket}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt 'Key.Arn'
+          - Sid: Deny unencrypted object uploads
+            Effect: Deny
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${Bucket}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          - Sid: Allow PutObject
+            Effect: Allow
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${Bucket}/*'
+          - Sid: Allow GetBucketLocation
+            Effect: Allow
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: 's3:GetBucketLocation'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${Bucket}'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+
+  Key:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: 'AWS::KMS::Key'
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: 'kms:*'
+          Resource: '*'
+        - Effect: Allow
+          Principal:
+            Service: 'guardduty.amazonaws.com'
+          Action: 'kms:GenerateDataKey'
+          Resource: '*'
+
+  LambdaFunctionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+        Path: "/"
+        Policies:
+        - PolicyName: LambdaFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - logs:PutLogEvents
+                - logs:*
+                - logs:CreateLogStream
+                - s3:ListBucket
+                - guardduty:CreatePublishingDestination
+                - lambda:*
+              Resource: '*'
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GuardDutyLogDestination
+      Runtime: python3.9
+      Timeout: 60
+      Handler: index.handler
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Environment:
+        Variables:
+          DetectorId: !Ref DetectorId
+          BucketArn: !GetAtt Bucket.Arn
+          KeyArn: !GetAtt 'Key.Arn'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          DetectorId = os.environ['DetectorId']
+          BucketArn = os.environ['BucketArn']
+          KeyArn = os.environ['KeyArn']
+          def handler(event, context):
+              # TODO implement
+              client = boto3.client('guardduty')
+              response = client.create_publishing_destination(
+                  DetectorId=DetectorId,
+                  DestinationType='S3',
+                  DestinationProperties={
+                      'DestinationArn': BucketArn,
+                      'KmsKeyArn': KeyArn
+                  }
+              )
+  LambdaFunction3:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GuardDutyCaller
+      Handler: index.handler
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+      
+          import boto3, json
+          
+          import cfnresponse
+
+          def handler(event, context):
+              print('EVENT:[{}]'.format(event))
+              lambda_client = boto3.client('lambda')
+              test_event = '{"name":"test1"}'
+              lambda_client.invoke(
+                  FunctionName='GuardDutyLogDestination',
+                  InvocationType='Event',
+                  Payload=test_event,
+              )
+              responseValue = 120
+              responseData = {}
+              responseData['Data'] = responseValue
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              
+    
+  Primerinvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: LambdaFunction3
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction3.Arn
